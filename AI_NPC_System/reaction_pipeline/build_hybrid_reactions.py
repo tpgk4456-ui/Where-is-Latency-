@@ -32,14 +32,19 @@ import json
 import random
 import re
 import time
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
+from zipfile import ZipFile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = ROOT / "hybrid_reactions.json"
 MODEL_NAME = "joeddav/distilbert-base-uncased-go-emotions-student"
+DAILY_DIALOG_URL = "http://yanran.li/files/ijcnlp_dailydialog.zip"
+DAILY_DIALOG_HF_MIRROR = "roskoN/dailydialog"
+RAW_CACHE_DIR = Path("/tmp/credo_hybrid_reaction_cache")
 
 CATEGORIES = ("Positive", "Negative", "Ambiguous", "Neutral")
 
@@ -77,6 +82,32 @@ LABEL_TO_CATEGORY = {
 WORD_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?")
 URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 SPACE_RE = re.compile(r"\s+")
+PUNCT_SPACE_RE = re.compile(r"\s+([?.!,;:])")
+ARTICLE_START_RE = re.compile(r"^(a|an|the)\s+[a-z0-9]", re.IGNORECASE)
+CONTEXT_BOUND_TERMS = {
+    "he",
+    "him",
+    "his",
+    "she",
+    "hers",
+    "they",
+    "them",
+    "their",
+    "theirs",
+}
+BLOCKED_TERMS = {
+    "fuck",
+    "fucking",
+    "fucked",
+    "shit",
+    "bullshit",
+    "bitch",
+    "bitches",
+    "asshole",
+    "dick",
+    "cunt",
+    "slur",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,6 +145,7 @@ def normalize_text(text: str) -> str | None:
     text = URL_RE.sub("", text)
     text = text.replace("\n", " ").replace("\r", " ")
     text = SPACE_RE.sub(" ", text).strip()
+    text = PUNCT_SPACE_RE.sub(r"\1", text)
     if not text:
         return None
     if len(text) > 96:
@@ -126,7 +158,24 @@ def normalize_text(text: str) -> str | None:
         return None
     if not WORD_RE.search(text):
         return None
+    words = {word.casefold() for word in WORD_RE.findall(text)}
+    if words & CONTEXT_BOUND_TERMS:
+        return None
+    if words & BLOCKED_TERMS:
+        return None
+    if any(mark in text for mark in ("#", "@", "*", "`", "|")):
+        return None
+    if ARTICLE_START_RE.search(text):
+        return None
+    if "please" in words:
+        return None
     return text
+
+
+def is_category_suitable(text: str, category: str) -> bool:
+    if category in {"Positive", "Negative"} and "?" in text:
+        return False
+    return True
 
 
 def word_count(text: str) -> int:
@@ -159,17 +208,67 @@ def cap_candidates(items: list[str], cap: int, seed: int) -> list[str]:
     return sorted(sampled, key=lambda x: order[x])
 
 
+def normalize_daily_dialog_split(split: str) -> str:
+    if split == "validation":
+        return "validation"
+    if split in {"valid", "val", "dev"}:
+        return "validation"
+    if split in {"train", "test"}:
+        return split
+    raise ValueError(f"Unsupported daily_dialog split: {split}")
+
+
+def download_daily_dialog_zip() -> Path:
+    RAW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    zip_path = RAW_CACHE_DIR / "ijcnlp_dailydialog.zip"
+    if zip_path.exists() and zip_path.stat().st_size > 0:
+        return zip_path
+    urllib.request.urlretrieve(DAILY_DIALOG_URL, zip_path)
+    return zip_path
+
+
+def download_daily_dialog_split_zip(split_name: str) -> Path:
+    try:
+        from huggingface_hub import hf_hub_download
+
+        return Path(
+            hf_hub_download(
+                repo_id=DAILY_DIALOG_HF_MIRROR,
+                repo_type="dataset",
+                filename=f"{split_name}.zip",
+            )
+        )
+    except Exception:
+        return download_daily_dialog_zip()
+
+
 def load_daily_dialog_candidates(load_dataset: Any, split: str, max_words: int) -> list[str]:
-    dataset = load_dataset("daily_dialog", split=split)
+    del load_dataset
+    split_name = normalize_daily_dialog_split(split)
+    zip_path = download_daily_dialog_split_zip(split_name)
     candidates: list[str] = []
-    for row in dataset:
-        dialogue = row.get("dialog") or []
-        for utterance in dialogue:
-            if not isinstance(utterance, str):
+    dialog_path = f"{split_name}/dialogues_{split_name}.txt"
+    with ZipFile(zip_path) as split_zip:
+        if dialog_path not in split_zip.namelist():
+            nested_zip_path = f"ijcnlp_dailydialog/{split_name}.zip"
+            with split_zip.open(nested_zip_path) as data_zip_file:
+                with ZipFile(data_zip_file) as nested_zip:
+                    return parse_daily_dialog_zip(nested_zip, dialog_path, max_words)
+        candidates = parse_daily_dialog_zip(split_zip, dialog_path, max_words)
+    return dedupe_keep_order(candidates)
+
+
+def parse_daily_dialog_zip(split_zip: ZipFile, dialog_path: str, max_words: int) -> list[str]:
+    candidates: list[str] = []
+    with split_zip.open(dialog_path) as dialog_file:
+        for raw_line in dialog_file:
+            line = raw_line.decode("utf-8", errors="ignore").strip()
+            if not line:
                 continue
-            text = normalize_text(utterance)
-            if text and is_short_reaction(text, max_words):
-                candidates.append(text)
+            for utterance in line.split("__eou__"):
+                text = normalize_text(utterance)
+                if text and is_short_reaction(text, max_words):
+                    candidates.append(text)
     return dedupe_keep_order(candidates)
 
 
@@ -203,12 +302,30 @@ def choose_device(torch: Any, requested: str) -> int:
     return 0 if torch.cuda.is_available() else -1
 
 
-def normalize_pipeline_result(item: Any) -> dict[str, Any]:
+def normalize_score_list(item: Any) -> list[dict[str, Any]]:
     if isinstance(item, list):
         if not item:
-            return {"label": "neutral", "score": 0.0}
-        return item[0]
-    return item
+            return [{"label": "neutral", "score": 0.0}]
+        if isinstance(item[0], list):
+            return item[0]
+        return item
+    return [item]
+
+
+def aggregate_category_scores(score_items: list[dict[str, Any]]) -> dict[str, float]:
+    scores = {category: 0.0 for category in CATEGORIES}
+    for item in score_items:
+        label = str(item.get("label", "neutral")).lower()
+        category = LABEL_TO_CATEGORY.get(label)
+        if category:
+            scores[category] += float(item.get("score", 0.0))
+    return scores
+
+
+def top_label(score_items: list[dict[str, Any]]) -> str:
+    if not score_items:
+        return "neutral"
+    return str(max(score_items, key=lambda item: float(item.get("score", 0.0))).get("label", "neutral")).lower()
 
 
 def classify_candidates(
@@ -229,17 +346,17 @@ def classify_candidates(
         results = classifier(batch, truncation=True, batch_size=batch_size)
 
         for text, raw in zip(batch, results):
-            result = normalize_pipeline_result(raw)
-            label = str(result.get("label", "neutral")).lower()
-            score = float(result.get("score", 0.0))
+            score_items = normalize_score_list(raw)
+            label = top_label(score_items)
+            category_scores = aggregate_category_scores(score_items)
+            category = max(category_scores, key=category_scores.get)
+            score = category_scores[category]
             label_counts[label] += 1
 
-            category = LABEL_TO_CATEGORY.get(label)
-            if category is None:
-                rejected_unmapped += 1
-                continue
             if score < score_threshold:
                 rejected_low_score += 1
+                continue
+            if not is_category_suitable(text, category):
                 continue
             buckets[category].append(text)
 
@@ -278,7 +395,7 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
         "text-classification",
         model=args.model,
         tokenizer=args.model,
-        top_k=1,
+        top_k=None,
         device=device,
     )
 
@@ -323,9 +440,18 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
         "score_threshold": args.score_threshold,
         "max_words": args.max_words,
         "sources": {
-            "everyday": "daily_dialog",
+            "everyday": f"daily_dialog raw train.zip mirror ({DAILY_DIALOG_HF_MIRROR})",
             "stream": "google-research-datasets/go_emotions:simplified",
         },
+        "score_threshold_mode": "sum DistilBERT label scores after mapping 28 GoEmotions labels into 4 categories",
+        "quality_filters": [
+            "max 5 words",
+            "ASCII text",
+            "URL/bracket/hashtag/mention/markdown removal",
+            "context-bound third-person pronoun removal",
+            "basic profanity removal",
+            "question removal for Positive and Negative categories",
+        ],
         "reports": [everyday_report, stream_report],
         "bucket_counts": {
             category: {

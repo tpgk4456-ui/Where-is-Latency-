@@ -74,6 +74,8 @@ class HybridFastTrackConfig:
     seed: int | None = None
     min_runtime_score: float = 0.0
     spacy_model: str = "en_core_web_sm"
+    everyday_weight: float = 0.60
+    stream_weight: float = 0.40
 
 
 def require_runtime_deps() -> tuple[Any, Any, Any]:
@@ -105,12 +107,28 @@ def load_reaction_db(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def normalize_pipeline_result(raw: Any) -> dict[str, Any]:
+def normalize_score_list(raw: Any) -> list[dict[str, Any]]:
     if isinstance(raw, list):
         if raw and isinstance(raw[0], list):
-            return raw[0][0] if raw[0] else {"label": "neutral", "score": 0.0}
-        return raw[0] if raw else {"label": "neutral", "score": 0.0}
-    return raw
+            return raw[0] if raw[0] else [{"label": "neutral", "score": 0.0}]
+        return raw if raw else [{"label": "neutral", "score": 0.0}]
+    return [raw]
+
+
+def aggregate_category_scores(score_items: list[dict[str, Any]]) -> dict[str, float]:
+    scores = {"Positive": 0.0, "Negative": 0.0, "Ambiguous": 0.0, "Neutral": 0.0}
+    for item in score_items:
+        label = str(item.get("label", "neutral")).lower()
+        category = LABEL_TO_CATEGORY.get(label)
+        if category:
+            scores[category] += float(item.get("score", 0.0))
+    return scores
+
+
+def top_label(score_items: list[dict[str, Any]]) -> str:
+    if not score_items:
+        return "neutral"
+    return str(max(score_items, key=lambda item: float(item.get("score", 0.0))).get("label", "neutral")).lower()
 
 
 class HybridFastTrack:
@@ -125,7 +143,7 @@ class HybridFastTrack:
             "text-classification",
             model=self.config.model_name,
             tokenizer=self.config.model_name,
-            top_k=1,
+            top_k=None,
             device=self.device,
         )
         self.nlp = spacy.load(
@@ -140,13 +158,14 @@ class HybridFastTrack:
 
     def classify_emotion(self, text: str) -> dict[str, Any]:
         raw = self.classifier(text[:512], truncation=True)
-        result = normalize_pipeline_result(raw)
-        label = str(result.get("label", "neutral")).lower()
-        score = float(result.get("score", 0.0))
-        category = LABEL_TO_CATEGORY.get(label, "Neutral")
+        score_items = normalize_score_list(raw)
+        label = top_label(score_items)
+        category_scores = aggregate_category_scores(score_items)
+        category = max(category_scores, key=category_scores.get)
+        score = category_scores[category]
         if score < self.config.min_runtime_score:
             category = "Neutral"
-        return {"category": category, "label": label, "score": score}
+        return {"category": category, "label": label, "score": score, "category_scores": category_scores}
 
     def extract_keywords(self, text: str) -> list[str]:
         doc = self.nlp(text)
@@ -156,15 +175,24 @@ class HybridFastTrack:
                 keywords.append(token.text)
         return keywords
 
-    def choose_reaction(self, category: str) -> str:
+    def choose_reaction(self, category: str) -> tuple[str, str]:
         bucket = self.reactions.get(category, {})
-        candidates: list[str] = []
         if isinstance(bucket, dict):
-            candidates.extend(bucket.get("everyday") or [])
-            candidates.extend(bucket.get("stream") or [])
-        if not candidates:
-            candidates = FALLBACK_REACTIONS.get(category, FALLBACK_REACTIONS["Neutral"])
-        return self.rng.choice(candidates)
+            everyday = bucket.get("everyday") or []
+            stream = bucket.get("stream") or []
+            if everyday and stream:
+                total_weight = max(0.0, self.config.everyday_weight) + max(0.0, self.config.stream_weight)
+                everyday_probability = self.config.everyday_weight / total_weight if total_weight else 0.5
+                source = "everyday" if self.rng.random() < everyday_probability else "stream"
+                candidates = everyday if source == "everyday" else stream
+                return self.rng.choice(candidates), source
+            if everyday:
+                return self.rng.choice(everyday), "everyday"
+            if stream:
+                return self.rng.choice(stream), "stream"
+
+        candidates = FALLBACK_REACTIONS.get(category, FALLBACK_REACTIONS["Neutral"])
+        return self.rng.choice(candidates), "fallback"
 
     def make_tts_text(self, reaction: str, keywords: list[str]) -> str:
         reaction = reaction.strip()
@@ -186,18 +214,20 @@ class HybridFastTrack:
         keywords = self.extract_keywords(user_text)
         keyword_ms = (time.perf_counter() - keyword_started) * 1000.0
 
-        reaction = self.choose_reaction(emotion["category"])
+        reaction, source = self.choose_reaction(emotion["category"])
         tts_text = self.make_tts_text(reaction, keywords)
         total_ms = (time.perf_counter() - started) * 1000.0
 
         return {
             "tts_text": tts_text,
             "reaction": reaction,
+            "reaction_source": source,
             "keyword": keywords[-1] if keywords else None,
             "keywords": keywords,
             "emotion": emotion["category"],
             "emotion_label": emotion["label"],
             "emotion_score": round(emotion["score"], 4),
+            "category_scores": {key: round(value, 4) for key, value in emotion["category_scores"].items()},
             "latency_ms": round(total_ms, 3),
             "emotion_ms": round(emotion_ms, 3),
             "keyword_ms": round(keyword_ms, 3),
@@ -225,6 +255,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-runtime-score", type=float, default=0.0)
+    parser.add_argument("--everyday-weight", type=float, default=0.60)
+    parser.add_argument("--stream-weight", type=float, default=0.40)
     return parser.parse_args()
 
 
@@ -236,6 +268,8 @@ def main() -> int:
             device=args.device,
             seed=args.seed,
             min_runtime_score=args.min_runtime_score,
+            everyday_weight=args.everyday_weight,
+            stream_weight=args.stream_weight,
         )
     )
     print(json.dumps(engine.generate(args.text), ensure_ascii=False, indent=2))
