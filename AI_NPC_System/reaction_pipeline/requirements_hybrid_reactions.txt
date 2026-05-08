@@ -1,0 +1,4 @@
+datasets>=2.18.0
+spacy>=3.7.0
+torch>=2.2.0
+transformers>=4.38.0
