@@ -73,11 +73,6 @@ class HybridFastTrackConfig:
     device: str = "auto"
     seed: int | None = None
     min_runtime_score: float = 0.0
-    min_runtime_margin: float = 0.0
-    ambiguous_min_runtime_score: float = 0.0
-    ambiguous_min_runtime_margin: float = 0.0
-    neutral_min_runtime_score: float = 0.0
-    neutral_max_runtime_margin: float = 1.0
     spacy_model: str = "en_core_web_sm"
     everyday_weight: float = 0.60
     stream_weight: float = 0.40
@@ -130,12 +125,6 @@ def aggregate_category_scores(score_items: list[dict[str, Any]]) -> dict[str, fl
     return scores
 
 
-def top_label(score_items: list[dict[str, Any]]) -> str:
-    if not score_items:
-        return "neutral"
-    return str(max(score_items, key=lambda item: float(item.get("score", 0.0))).get("label", "neutral")).lower()
-
-
 def ranked_label_scores(score_items: list[dict[str, Any]]) -> list[tuple[str, float]]:
     ranked = [
         (str(item.get("label", "neutral")).lower(), float(item.get("score", 0.0)))
@@ -177,32 +166,9 @@ class HybridFastTrack:
         second_score = ranked_labels[1][1] if len(ranked_labels) > 1 else 0.0
         margin = score - second_score
         category_scores = aggregate_category_scores(score_items)
+        category = LABEL_TO_CATEGORY.get(label, "Neutral")
 
-        if label == "neutral":
-            category = "Neutral"
-            score_threshold = self.config.neutral_min_runtime_score
-            if score < score_threshold or margin > self.config.neutral_max_runtime_margin:
-                category = "Neutral"
-            return {
-                "category": category,
-                "label": label,
-                "score": score,
-                "margin": margin,
-                "category_scores": category_scores,
-            }
-        else:
-            ranked_categories = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
-            category, score = ranked_categories[0]
-            second_score = ranked_categories[1][1] if len(ranked_categories) > 1 else 0.0
-            margin = score - second_score
-            if category == "Ambiguous":
-                score_threshold = self.config.ambiguous_min_runtime_score
-                margin_threshold = self.config.ambiguous_min_runtime_margin
-            else:
-                score_threshold = self.config.min_runtime_score
-                margin_threshold = self.config.min_runtime_margin
-
-        if score < score_threshold or margin < margin_threshold:
+        if score < self.config.min_runtime_score:
             category = "Neutral"
         return {
             "category": category,
@@ -246,6 +212,8 @@ class HybridFastTrack:
         keyword = keywords[-1].strip(".,!?;:\"'()")
         if not keyword:
             return reaction
+        if reaction.endswith("?"):
+            return f"{reaction[:-1].strip()} {keyword}?"
         return f"{reaction} {keyword}?"
 
     def generate(self, user_text: str) -> dict[str, Any]:
@@ -301,11 +269,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-runtime-score", type=float, default=0.0)
-    parser.add_argument("--min-runtime-margin", type=float, default=0.0)
-    parser.add_argument("--ambiguous-min-runtime-score", type=float, default=0.0)
-    parser.add_argument("--ambiguous-min-runtime-margin", type=float, default=0.0)
-    parser.add_argument("--neutral-min-runtime-score", type=float, default=0.0)
-    parser.add_argument("--neutral-max-runtime-margin", type=float, default=1.0)
     parser.add_argument("--everyday-weight", type=float, default=0.60)
     parser.add_argument("--stream-weight", type=float, default=0.40)
     return parser.parse_args()
@@ -319,11 +282,6 @@ def main() -> int:
             device=args.device,
             seed=args.seed,
             min_runtime_score=args.min_runtime_score,
-            min_runtime_margin=args.min_runtime_margin,
-            ambiguous_min_runtime_score=args.ambiguous_min_runtime_score,
-            ambiguous_min_runtime_margin=args.ambiguous_min_runtime_margin,
-            neutral_min_runtime_score=args.neutral_min_runtime_score,
-            neutral_max_runtime_margin=args.neutral_max_runtime_margin,
             everyday_weight=args.everyday_weight,
             stream_weight=args.stream_weight,
         )

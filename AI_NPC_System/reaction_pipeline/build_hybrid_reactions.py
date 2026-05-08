@@ -20,6 +20,12 @@ Install:
 Run:
   python3 AI_NPC_System/reaction_pipeline/build_hybrid_reactions.py
 
+Run with the local vLLM judge:
+  python3 AI_NPC_System/reaction_pipeline/build_hybrid_reactions.py \
+    --llm-filter \
+    --llm-base-url http://127.0.0.1:8001/v1 \
+    --llm-model qwen2.5:7b
+
 Use --max-everyday-candidates 0 --max-stream-candidates 0 to classify every
 short candidate found in both datasets. The defaults cap candidate counts so
 the first experiment can finish quickly on a CPU machine.
@@ -33,6 +39,7 @@ import random
 import re
 import time
 import urllib.request
+import urllib.error
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -47,6 +54,17 @@ DAILY_DIALOG_HF_MIRROR = "roskoN/dailydialog"
 RAW_CACHE_DIR = Path("/tmp/credo_hybrid_reaction_cache")
 
 CATEGORIES = ("Positive", "Negative", "Ambiguous", "Neutral")
+BLOCKED_ENTITY_LABELS = {
+    "PERSON",
+    "ORG",
+    "GPE",
+    "LOC",
+    "NORP",
+    "FAC",
+    "EVENT",
+    "PRODUCT",
+    "WORK_OF_ART",
+}
 
 LABEL_TO_CATEGORY = {
     "admiration": "Positive",
@@ -84,6 +102,7 @@ URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 SPACE_RE = re.compile(r"\s+")
 PUNCT_SPACE_RE = re.compile(r"\s+([?.!,;:])")
 ARTICLE_START_RE = re.compile(r"^(a|an|the)\s+[a-z0-9]", re.IGNORECASE)
+EMOTICON_RE = re.compile(r"[:;=xX][-']?[)(DPpOo/]|[()']\s*[vV]\s*[()']")
 CONTEXT_BOUND_TERMS = {
     "he",
     "he's",
@@ -104,32 +123,83 @@ BLOCKED_TERMS = {
     "fucked",
     "shit",
     "bullshit",
+    "bait",
     "bitch",
     "bitches",
+    "bloody",
+    "boring",
     "asshole",
+    "arrest",
+    "cringy",
+    "death",
     "dick",
+    "demon",
     "cunt",
     "cringe",
     "delusional",
+    "fcuk",
     "horny",
     "incel",
+    "goddamn",
+    "jail",
+    "scam",
     "slur",
+    "suck",
+    "sucks",
     "terrible",
+    "troll",
     "weed",
     "weeds",
 }
+BLOCKED_REFERENCE_TERMS = {
+    "bot",
+    "awil",
+    "axe",
+    "bears",
+    "bike",
+    "bill",
+    "cakeday",
+    "cake",
+    "cervezas",
+    "cindy",
+    "cod",
+    "clip",
+    "clop",
+    "del",
+    "dolma",
+    "gynolette",
+    "halloween",
+    "heroes",
+    "jason",
+    "john",
+    "kenji",
+    "leslie",
+    "lpt",
+    "movie",
+    "nancy",
+    "preller",
+    "reddit",
+    "sides",
+    "supen",
+    "trigger",
+    "video",
+    "videos",
+    "wig",
+    "woke",
+}
+ALLOWED_UPPERCASE_TOKENS = {"I", "OK", "TV"}
+BLOCKED_PHRASE_RE = re.compile(
+    r"^(alright stop|choose wisely|come back|get out|go back|go to|freeze)\b|"
+    r"\b(social construct|snu snu|good luck going to jail)\b",
+    re.IGNORECASE,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build hybrid Fast Track reaction JSON.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--model", default=MODEL_NAME)
-    parser.add_argument("--emotion-min-top-score", type=float, default=0.45)
-    parser.add_argument("--emotion-min-margin", type=float, default=0.50)
-    parser.add_argument("--ambiguous-min-top-score", type=float, default=0.35)
-    parser.add_argument("--ambiguous-min-margin", type=float, default=0.15)
-    parser.add_argument("--neutral-min-top-score", type=float, default=0.15)
-    parser.add_argument("--neutral-max-margin", type=float, default=0.18)
+    parser.add_argument("--min-top-score", type=float, default=0.0)
     parser.add_argument("--max-words", type=int, default=5)
     parser.add_argument("--daily-split", default="train")
     parser.add_argument("--goemotions-split", default="train")
@@ -140,6 +210,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-per-bucket", type=int, default=400)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--torch-threads", type=int, default=0)
+    parser.add_argument("--llm-filter", action="store_true")
+    parser.add_argument("--llm-provider", default="openai", choices=("openai", "ollama"))
+    parser.add_argument("--llm-base-url", default="http://127.0.0.1:8001/v1")
+    parser.add_argument("--llm-model", default="qwen2.5:7b")
+    parser.add_argument("--llm-timeout", type=float, default=60.0)
+    parser.add_argument("--llm-max-tokens", type=int, default=512)
+    parser.add_argument("--llm-batch-size", type=int, default=12)
+    parser.add_argument("--llm-max-candidates-per-bucket", type=int, default=600)
+    parser.add_argument("--spacy-filter-model", default="en_core_web_sm")
+    parser.add_argument("--disable-spacy-reference-filter", action="store_true")
     return parser.parse_args()
 
 
@@ -167,6 +247,14 @@ def normalize_text(text: str) -> str | None:
         return None
     if any(mark in text for mark in ("<", ">", "{", "}", "[", "]")):
         return None
+    if any(mark in text for mark in ('"', "(", ")", "%")):
+        return None
+    if any(ch.isdigit() for ch in text):
+        return None
+    if BLOCKED_PHRASE_RE.search(text):
+        return None
+    if EMOTICON_RE.search(text):
+        return None
     try:
         text.encode("ascii")
     except UnicodeEncodeError:
@@ -174,12 +262,22 @@ def normalize_text(text: str) -> str | None:
     if not WORD_RE.search(text):
         return None
     words = {word.casefold() for word in WORD_RE.findall(text)}
+    lowered = text.casefold()
+    if re.search(r"\bf+u+c*k+\w*\b", lowered) or re.search(r"\bf+u+k+\w*\b", lowered):
+        return None
     if words & CONTEXT_BOUND_TERMS:
         return None
     if words & BLOCKED_TERMS:
         return None
-    if any(mark in text for mark in ("#", "@", "*", "`", "|")):
+    if words & BLOCKED_REFERENCE_TERMS:
         return None
+    if any(mark in text for mark in ("#", "@", "*", "`", "|", "^")):
+        return None
+    if "/" in text and not re.search(r"\b(and|or)\b", text, re.IGNORECASE):
+        return None
+    for token in re.findall(r"\b[A-Z]{2,}\b", text):
+        if token not in ALLOWED_UPPERCASE_TOKENS:
+            return None
     if ARTICLE_START_RE.search(text):
         return None
     if "please" in words:
@@ -351,22 +449,233 @@ def ranked_label_scores(score_items: list[dict[str, Any]]) -> list[tuple[str, fl
     return sorted(ranked, key=lambda item: item[1], reverse=True)
 
 
+def local_llm_chat(args: argparse.Namespace, prompt: str, max_tokens: int | None = None) -> str:
+    response_tokens = max_tokens if max_tokens is not None else args.llm_max_tokens
+    if args.llm_provider == "ollama":
+        url = args.llm_base_url.rstrip("/")
+        if url.endswith("/v1"):
+            url = url[:-3]
+        endpoint = f"{url}/api/chat"
+        payload = {
+            "model": args.llm_model,
+            "stream": False,
+            "options": {"temperature": 0, "num_predict": response_tokens},
+            "messages": [{"role": "user", "content": prompt}],
+        }
+    else:
+        endpoint = f"{args.llm_base_url.rstrip('/')}/chat/completions"
+        payload = {
+            "model": args.llm_model,
+            "temperature": 0,
+            "max_tokens": response_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=args.llm_timeout) as response:
+            obj = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Local LLM request failed at {endpoint}: {exc}") from exc
+
+    if args.llm_provider == "ollama":
+        return str(obj.get("message", {}).get("content", "")).strip()
+    return str(obj.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+
+
+def llm_accepts_reaction(args: argparse.Namespace, text: str, category: str, source_name: str) -> bool:
+    prompt = (
+        "You are filtering short English VTuber reaction lines.\n"
+        "Return exactly YES or NO.\n\n"
+        "Accept only if the sentence can be spoken as a short, standalone live-stream reaction.\n"
+        "Reject if it is context-dependent, too specific, a full personal situation, a command/request, "
+        "a product/place/person reference, sexual/political/offensive, confusing without thread context, "
+        "or unnatural for TTS.\n"
+        "Questions are acceptable only for Ambiguous reactions.\n\n"
+        f"Target category: {category}\n"
+        f"Source: {source_name}\n"
+        f"Sentence: {text!r}\n\n"
+        "Answer:"
+    )
+    answer = local_llm_chat(args, prompt).strip().upper()
+    return answer.startswith("YES")
+
+
+def parse_llm_json_array(text: str) -> list[Any]:
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"No JSON array found in LLM response: {text!r}")
+    return json.loads(text[start : end + 1])
+
+
+def llm_accepts_reaction_batch(
+    args: argparse.Namespace,
+    texts: list[str],
+    category: str,
+    source_name: str,
+) -> list[bool]:
+    if len(texts) == 1:
+        return [llm_accepts_reaction(args, texts[0], category, source_name)]
+
+    items = [{"index": index, "sentence": text} for index, text in enumerate(texts)]
+    prompt = (
+        "You are filtering short English VTuber reaction lines.\n"
+        "Return only a JSON array. Do not add markdown or explanations.\n"
+        "Each output object must be {\"index\": number, \"accept\": true or false}.\n\n"
+        "Accept only if the sentence can be spoken as a short, standalone live-stream reaction.\n"
+        "Reject if it is context-dependent, too specific, a full personal situation, a command/request, "
+        "a product/place/person reference, sexual/political/offensive, confusing without thread context, "
+        "or unnatural for TTS.\n"
+        "Questions are acceptable only for Ambiguous reactions.\n\n"
+        f"Target category: {category}\n"
+        f"Source: {source_name}\n"
+        f"Items: {json.dumps(items, ensure_ascii=False)}"
+    )
+
+    try:
+        answer = local_llm_chat(args, prompt, max_tokens=args.llm_max_tokens)
+        parsed = parse_llm_json_array(answer)
+        decisions = [False] * len(texts)
+        for item in parsed:
+            index = int(item.get("index"))
+            if 0 <= index < len(decisions):
+                decisions[index] = bool(item.get("accept"))
+        return decisions
+    except Exception as exc:
+        print(f"LLM batch parse failed for {source_name}/{category}; falling back to single calls: {exc}")
+        return [llm_accepts_reaction(args, text, category, source_name) for text in texts]
+
+
+def llm_filter_buckets(
+    args: argparse.Namespace,
+    buckets: dict[str, list[str]],
+    source_name: str,
+) -> tuple[dict[str, list[str]], dict[str, Any]]:
+    if not args.llm_filter:
+        return buckets, {"enabled": False}
+
+    rng = random.Random(args.seed + (17 if source_name == "go_emotions" else 0))
+    filtered: dict[str, list[str]] = {category: [] for category in CATEGORIES}
+    checked = 0
+    accepted = 0
+    rejected = 0
+    per_category: dict[str, dict[str, int]] = {}
+
+    for category, values in buckets.items():
+        unique_values = dedupe_keep_order(values)
+        if args.llm_max_candidates_per_bucket > 0 and len(unique_values) > args.llm_max_candidates_per_bucket:
+            unique_values = rng.sample(unique_values, args.llm_max_candidates_per_bucket)
+            unique_values.sort(key=str.casefold)
+
+        cat_checked = 0
+        cat_accepted = 0
+        batch_size = max(1, args.llm_batch_size)
+        for start in range(0, len(unique_values), batch_size):
+            batch = unique_values[start : start + batch_size]
+            decisions = llm_accepts_reaction_batch(args, batch, category, source_name)
+            for text, accepted_by_llm in zip(batch, decisions):
+                cat_checked += 1
+                checked += 1
+                if accepted_by_llm:
+                    filtered[category].append(text)
+                    cat_accepted += 1
+                    accepted += 1
+                else:
+                    rejected += 1
+            if cat_checked % 48 == 0 or cat_checked == len(unique_values):
+                print(
+                    f"LLM filter {source_name}/{category}: "
+                    f"{cat_accepted}/{cat_checked} accepted so far"
+                )
+
+        per_category[category] = {
+            "checked": cat_checked,
+            "accepted": cat_accepted,
+            "rejected": cat_checked - cat_accepted,
+        }
+        print(f"LLM filter {source_name}/{category}: {cat_accepted}/{cat_checked} accepted")
+
+    return filtered, {
+        "enabled": True,
+        "provider": args.llm_provider,
+        "base_url": args.llm_base_url,
+        "model": args.llm_model,
+        "batch_size": args.llm_batch_size,
+        "max_candidates_per_bucket": args.llm_max_candidates_per_bucket,
+        "checked": checked,
+        "accepted": accepted,
+        "rejected": rejected,
+        "per_category": per_category,
+    }
+
+
+def spacy_reference_filter_buckets(
+    args: argparse.Namespace,
+    buckets: dict[str, list[str]],
+    source_name: str,
+) -> tuple[dict[str, list[str]], dict[str, Any]]:
+    if args.disable_spacy_reference_filter:
+        return buckets, {"enabled": False}
+
+    try:
+        import spacy
+    except ImportError:
+        return buckets, {"enabled": False, "reason": "spacy is not installed"}
+
+    try:
+        nlp = spacy.load(args.spacy_filter_model)
+    except OSError:
+        return buckets, {"enabled": False, "reason": f"{args.spacy_filter_model} is not installed"}
+
+    filtered: dict[str, list[str]] = {category: [] for category in CATEGORIES}
+    per_category: dict[str, dict[str, int]] = {}
+    checked = 0
+    accepted = 0
+
+    for category, values in buckets.items():
+        cat_checked = 0
+        cat_accepted = 0
+        for text in values:
+            checked += 1
+            cat_checked += 1
+            doc = nlp(text)
+            has_blocked_entity = any(ent.label_ in BLOCKED_ENTITY_LABELS for ent in doc.ents)
+            has_proper_noun = any(token.pos_ == "PROPN" for token in doc)
+            if has_blocked_entity or has_proper_noun:
+                continue
+            filtered[category].append(text)
+            accepted += 1
+            cat_accepted += 1
+
+        per_category[category] = {
+            "checked": cat_checked,
+            "accepted": cat_accepted,
+            "rejected": cat_checked - cat_accepted,
+        }
+        print(f"spaCy reference filter {source_name}/{category}: {cat_accepted}/{cat_checked} accepted")
+
+    return filtered, {
+        "enabled": True,
+        "model": args.spacy_filter_model,
+        "checked": checked,
+        "accepted": accepted,
+        "rejected": checked - accepted,
+        "blocked_entity_labels": sorted(BLOCKED_ENTITY_LABELS),
+        "per_category": per_category,
+    }
+
+
 def classify_candidates(
     classifier: Any,
     candidates: list[str],
     source_name: str,
-    emotion_min_top_score: float,
-    emotion_min_margin: float,
-    ambiguous_min_top_score: float,
-    ambiguous_min_margin: float,
-    neutral_min_top_score: float,
-    neutral_max_margin: float,
+    min_top_score: float,
     batch_size: int,
 ) -> tuple[dict[str, list[str]], dict[str, Any]]:
     buckets: dict[str, list[str]] = {category: [] for category in CATEGORIES}
     rejected_low_top_score = 0
-    rejected_low_margin = 0
-    rejected_high_neutral_margin = 0
     rejected_unmapped = 0
     label_counts: dict[str, int] = defaultdict(int)
 
@@ -379,43 +688,16 @@ def classify_candidates(
             score_items = normalize_score_list(raw)
             ranked_labels = ranked_label_scores(score_items)
             label, score = ranked_labels[0]
-            second_score = ranked_labels[1][1] if len(ranked_labels) > 1 else 0.0
-            margin = score - second_score
-            category_scores = aggregate_category_scores(score_items)
-            if label == "neutral":
-                category = "Neutral"
-            else:
-                ranked_categories = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
-                category, score = ranked_categories[0]
-                second_score = ranked_categories[1][1] if len(ranked_categories) > 1 else 0.0
-                margin = score - second_score
+            category = LABEL_TO_CATEGORY.get(label)
             label_counts[label] += 1
 
             if category is None:
                 rejected_unmapped += 1
                 continue
 
-            if category == "Neutral":
-                if score < neutral_min_top_score:
-                    rejected_low_top_score += 1
-                    continue
-                if margin > neutral_max_margin:
-                    rejected_high_neutral_margin += 1
-                    continue
-            else:
-                if category == "Ambiguous":
-                    top_score_threshold = ambiguous_min_top_score
-                    margin_threshold = ambiguous_min_margin
-                else:
-                    top_score_threshold = emotion_min_top_score
-                    margin_threshold = emotion_min_margin
-
-                if score < top_score_threshold:
-                    rejected_low_top_score += 1
-                    continue
-                if margin < margin_threshold:
-                    rejected_low_margin += 1
-                    continue
+            if score < min_top_score:
+                rejected_low_top_score += 1
+                continue
 
             if not is_category_suitable(text, category):
                 continue
@@ -427,8 +709,6 @@ def classify_candidates(
         "input_candidates": len(candidates),
         "kept": sum(len(values) for values in buckets.values()),
         "rejected_low_top_score": rejected_low_top_score,
-        "rejected_low_margin": rejected_low_margin,
-        "rejected_high_neutral_margin": rejected_high_neutral_margin,
         "rejected_unmapped": rejected_unmapped,
         "elapsed_seconds": round(elapsed, 3),
         "label_counts": dict(sorted(label_counts.items())),
@@ -453,6 +733,12 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
     if args.torch_threads > 0:
         torch.set_num_threads(args.torch_threads)
 
+    if args.llm_filter:
+        probe = local_llm_chat(args, "Return exactly YES.")
+        if not probe.strip().upper().startswith("YES"):
+            raise RuntimeError(f"Local LLM preflight failed: expected YES, got {probe!r}")
+        print(f"Local LLM filter ready: {args.llm_model} at {args.llm_base_url}")
+
     device = choose_device(torch, args.device)
     classifier = pipeline(
         "text-classification",
@@ -476,26 +762,23 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
         classifier=classifier,
         candidates=everyday,
         source_name="daily_dialog",
-        emotion_min_top_score=args.emotion_min_top_score,
-        emotion_min_margin=args.emotion_min_margin,
-        ambiguous_min_top_score=args.ambiguous_min_top_score,
-        ambiguous_min_margin=args.ambiguous_min_margin,
-        neutral_min_top_score=args.neutral_min_top_score,
-        neutral_max_margin=args.neutral_max_margin,
+        min_top_score=args.min_top_score,
         batch_size=args.batch_size,
     )
     stream_buckets, stream_report = classify_candidates(
         classifier=classifier,
         candidates=stream,
         source_name="go_emotions",
-        emotion_min_top_score=args.emotion_min_top_score,
-        emotion_min_margin=args.emotion_min_margin,
-        ambiguous_min_top_score=args.ambiguous_min_top_score,
-        ambiguous_min_margin=args.ambiguous_min_margin,
-        neutral_min_top_score=args.neutral_min_top_score,
-        neutral_max_margin=args.neutral_max_margin,
+        min_top_score=args.min_top_score,
         batch_size=args.batch_size,
     )
+
+    everyday_buckets, everyday_llm_report = llm_filter_buckets(args, everyday_buckets, "daily_dialog")
+    stream_buckets, stream_llm_report = llm_filter_buckets(args, stream_buckets, "go_emotions")
+    everyday_buckets, everyday_spacy_report = spacy_reference_filter_buckets(
+        args, everyday_buckets, "daily_dialog"
+    )
+    stream_buckets, stream_spacy_report = spacy_reference_filter_buckets(args, stream_buckets, "go_emotions")
 
     everyday_buckets = trim_buckets(everyday_buckets, args.max_per_bucket, args.seed)
     stream_buckets = trim_buckets(stream_buckets, args.max_per_bucket, args.seed + 1)
@@ -510,18 +793,14 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
     output["meta"] = {
         "version": "hybrid-v01",
         "model": args.model,
-        "emotion_min_top_score": args.emotion_min_top_score,
-        "emotion_min_margin": args.emotion_min_margin,
-        "ambiguous_min_top_score": args.ambiguous_min_top_score,
-        "ambiguous_min_margin": args.ambiguous_min_margin,
-        "neutral_min_top_score": args.neutral_min_top_score,
-        "neutral_max_margin": args.neutral_max_margin,
+        "distilbert_labeling": "original 28-label top-1 label mapped to 4 categories",
+        "min_top_score": args.min_top_score,
         "max_words": args.max_words,
         "sources": {
             "everyday": f"daily_dialog raw train.zip mirror ({DAILY_DIALOG_HF_MIRROR})",
             "stream": "google-research-datasets/go_emotions:simplified",
         },
-        "confidence_filter": "Positive/Negative require high 4-way category dominance; Ambiguous uses a looser 4-way category dominance filter; Neutral requires original neutral top-label with low top-vs-second margin because Neutral represents weak or mixed affect rather than strong dominance",
+        "confidence_filter": "DistilBERT uses top-1 original label only; optional local LLM judge filters standalone VTuber reaction quality.",
         "quality_filters": [
             "max 5 words",
             "ASCII text",
@@ -529,8 +808,11 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
             "context-bound third-person pronoun removal",
             "basic profanity removal",
             "question removal for Positive, Negative, and Neutral categories",
+            "spaCy named-entity and proper-noun reference removal",
         ],
         "reports": [everyday_report, stream_report],
+        "llm_filter_reports": [everyday_llm_report, stream_llm_report],
+        "spacy_reference_filter_reports": [everyday_spacy_report, stream_spacy_report],
         "bucket_counts": {
             category: {
                 "everyday": len(output[category]["everyday"]),
