@@ -73,6 +73,7 @@ class HybridFastTrackConfig:
     device: str = "auto"
     seed: int | None = None
     min_runtime_score: float = 0.0
+    min_runtime_margin: float = 0.0
     spacy_model: str = "en_core_web_sm"
     everyday_weight: float = 0.60
     stream_weight: float = 0.40
@@ -161,11 +162,19 @@ class HybridFastTrack:
         score_items = normalize_score_list(raw)
         label = top_label(score_items)
         category_scores = aggregate_category_scores(score_items)
-        category = max(category_scores, key=category_scores.get)
-        score = category_scores[category]
-        if score < self.config.min_runtime_score:
+        ranked_categories = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
+        category, score = ranked_categories[0]
+        second_score = ranked_categories[1][1] if len(ranked_categories) > 1 else 0.0
+        margin = score - second_score
+        if score < self.config.min_runtime_score or margin < self.config.min_runtime_margin:
             category = "Neutral"
-        return {"category": category, "label": label, "score": score, "category_scores": category_scores}
+        return {
+            "category": category,
+            "label": label,
+            "score": score,
+            "margin": margin,
+            "category_scores": category_scores,
+        }
 
     def extract_keywords(self, text: str) -> list[str]:
         doc = self.nlp(text)
@@ -227,6 +236,7 @@ class HybridFastTrack:
             "emotion": emotion["category"],
             "emotion_label": emotion["label"],
             "emotion_score": round(emotion["score"], 4),
+            "emotion_margin": round(emotion["margin"], 4),
             "category_scores": {key: round(value, 4) for key, value in emotion["category_scores"].items()},
             "latency_ms": round(total_ms, 3),
             "emotion_ms": round(emotion_ms, 3),
@@ -255,6 +265,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-runtime-score", type=float, default=0.0)
+    parser.add_argument("--min-runtime-margin", type=float, default=0.0)
     parser.add_argument("--everyday-weight", type=float, default=0.60)
     parser.add_argument("--stream-weight", type=float, default=0.40)
     return parser.parse_args()
@@ -268,6 +279,7 @@ def main() -> int:
             device=args.device,
             seed=args.seed,
             min_runtime_score=args.min_runtime_score,
+            min_runtime_margin=args.min_runtime_margin,
             everyday_weight=args.everyday_weight,
             stream_weight=args.stream_weight,
         )

@@ -114,7 +114,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build hybrid Fast Track reaction JSON.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--model", default=MODEL_NAME)
-    parser.add_argument("--score-threshold", type=float, default=0.70)
+    parser.add_argument("--min-top-score", type=float, default=0.45)
+    parser.add_argument("--min-margin", type=float, default=0.50)
     parser.add_argument("--max-words", type=int, default=5)
     parser.add_argument("--daily-split", default="train")
     parser.add_argument("--goemotions-split", default="train")
@@ -332,11 +333,13 @@ def classify_candidates(
     classifier: Any,
     candidates: list[str],
     source_name: str,
-    score_threshold: float,
+    min_top_score: float,
+    min_margin: float,
     batch_size: int,
 ) -> tuple[dict[str, list[str]], dict[str, Any]]:
     buckets: dict[str, list[str]] = {category: [] for category in CATEGORIES}
-    rejected_low_score = 0
+    rejected_low_top_score = 0
+    rejected_low_margin = 0
     rejected_unmapped = 0
     label_counts: dict[str, int] = defaultdict(int)
 
@@ -349,12 +352,17 @@ def classify_candidates(
             score_items = normalize_score_list(raw)
             label = top_label(score_items)
             category_scores = aggregate_category_scores(score_items)
-            category = max(category_scores, key=category_scores.get)
-            score = category_scores[category]
+            ranked_categories = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
+            category, score = ranked_categories[0]
+            second_score = ranked_categories[1][1] if len(ranked_categories) > 1 else 0.0
+            margin = score - second_score
             label_counts[label] += 1
 
-            if score < score_threshold:
-                rejected_low_score += 1
+            if score < min_top_score:
+                rejected_low_top_score += 1
+                continue
+            if margin < min_margin:
+                rejected_low_margin += 1
                 continue
             if not is_category_suitable(text, category):
                 continue
@@ -365,7 +373,8 @@ def classify_candidates(
         "source": source_name,
         "input_candidates": len(candidates),
         "kept": sum(len(values) for values in buckets.values()),
-        "rejected_low_score": rejected_low_score,
+        "rejected_low_top_score": rejected_low_top_score,
+        "rejected_low_margin": rejected_low_margin,
         "rejected_unmapped": rejected_unmapped,
         "elapsed_seconds": round(elapsed, 3),
         "label_counts": dict(sorted(label_counts.items())),
@@ -413,14 +422,16 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
         classifier=classifier,
         candidates=everyday,
         source_name="daily_dialog",
-        score_threshold=args.score_threshold,
+        min_top_score=args.min_top_score,
+        min_margin=args.min_margin,
         batch_size=args.batch_size,
     )
     stream_buckets, stream_report = classify_candidates(
         classifier=classifier,
         candidates=stream,
         source_name="go_emotions",
-        score_threshold=args.score_threshold,
+        min_top_score=args.min_top_score,
+        min_margin=args.min_margin,
         batch_size=args.batch_size,
     )
 
@@ -437,13 +448,14 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
     output["meta"] = {
         "version": "hybrid-v01",
         "model": args.model,
-        "score_threshold": args.score_threshold,
+        "min_top_score": args.min_top_score,
+        "min_margin": args.min_margin,
         "max_words": args.max_words,
         "sources": {
             "everyday": f"daily_dialog raw train.zip mirror ({DAILY_DIALOG_HF_MIRROR})",
             "stream": "google-research-datasets/go_emotions:simplified",
         },
-        "score_threshold_mode": "sum DistilBERT label scores after mapping 28 GoEmotions labels into 4 categories",
+        "confidence_filter": "after mapping 28 GoEmotions labels into 4 categories, keep items where top_category_score >= min_top_score and top_category_score - second_category_score >= min_margin",
         "quality_filters": [
             "max 5 words",
             "ASCII text",
