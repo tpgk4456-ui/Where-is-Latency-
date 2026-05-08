@@ -86,11 +86,14 @@ PUNCT_SPACE_RE = re.compile(r"\s+([?.!,;:])")
 ARTICLE_START_RE = re.compile(r"^(a|an|the)\s+[a-z0-9]", re.IGNORECASE)
 CONTEXT_BOUND_TERMS = {
     "he",
+    "he's",
     "him",
     "his",
     "she",
+    "she's",
     "hers",
     "they",
+    "they're",
     "them",
     "their",
     "theirs",
@@ -106,7 +109,14 @@ BLOCKED_TERMS = {
     "asshole",
     "dick",
     "cunt",
+    "cringe",
+    "delusional",
+    "horny",
+    "incel",
     "slur",
+    "terrible",
+    "weed",
+    "weeds",
 }
 
 
@@ -114,10 +124,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build hybrid Fast Track reaction JSON.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--model", default=MODEL_NAME)
-    parser.add_argument("--min-top-score", type=float, default=0.45)
-    parser.add_argument("--min-margin", type=float, default=0.50)
-    parser.add_argument("--neutral-min-top-score", type=float, default=0.20)
-    parser.add_argument("--neutral-min-margin", type=float, default=0.08)
+    parser.add_argument("--emotion-min-top-score", type=float, default=0.45)
+    parser.add_argument("--emotion-min-margin", type=float, default=0.50)
+    parser.add_argument("--ambiguous-min-top-score", type=float, default=0.35)
+    parser.add_argument("--ambiguous-min-margin", type=float, default=0.15)
+    parser.add_argument("--neutral-min-top-score", type=float, default=0.15)
+    parser.add_argument("--neutral-max-margin", type=float, default=0.18)
     parser.add_argument("--max-words", type=int, default=5)
     parser.add_argument("--daily-split", default="train")
     parser.add_argument("--goemotions-split", default="train")
@@ -176,7 +188,7 @@ def normalize_text(text: str) -> str | None:
 
 
 def is_category_suitable(text: str, category: str) -> bool:
-    if category in {"Positive", "Negative"} and "?" in text:
+    if category in {"Positive", "Negative", "Neutral"} and "?" in text:
         return False
     return True
 
@@ -343,15 +355,18 @@ def classify_candidates(
     classifier: Any,
     candidates: list[str],
     source_name: str,
-    min_top_score: float,
-    min_margin: float,
+    emotion_min_top_score: float,
+    emotion_min_margin: float,
+    ambiguous_min_top_score: float,
+    ambiguous_min_margin: float,
     neutral_min_top_score: float,
-    neutral_min_margin: float,
+    neutral_max_margin: float,
     batch_size: int,
 ) -> tuple[dict[str, list[str]], dict[str, Any]]:
     buckets: dict[str, list[str]] = {category: [] for category in CATEGORIES}
     rejected_low_top_score = 0
     rejected_low_margin = 0
+    rejected_high_neutral_margin = 0
     rejected_unmapped = 0
     label_counts: dict[str, int] = defaultdict(int)
 
@@ -369,26 +384,39 @@ def classify_candidates(
             category_scores = aggregate_category_scores(score_items)
             if label == "neutral":
                 category = "Neutral"
-                top_score_threshold = neutral_min_top_score
-                margin_threshold = neutral_min_margin
             else:
                 ranked_categories = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
                 category, score = ranked_categories[0]
                 second_score = ranked_categories[1][1] if len(ranked_categories) > 1 else 0.0
                 margin = score - second_score
-                top_score_threshold = min_top_score
-                margin_threshold = min_margin
             label_counts[label] += 1
 
             if category is None:
                 rejected_unmapped += 1
                 continue
-            if score < top_score_threshold:
-                rejected_low_top_score += 1
-                continue
-            if margin < margin_threshold:
-                rejected_low_margin += 1
-                continue
+
+            if category == "Neutral":
+                if score < neutral_min_top_score:
+                    rejected_low_top_score += 1
+                    continue
+                if margin > neutral_max_margin:
+                    rejected_high_neutral_margin += 1
+                    continue
+            else:
+                if category == "Ambiguous":
+                    top_score_threshold = ambiguous_min_top_score
+                    margin_threshold = ambiguous_min_margin
+                else:
+                    top_score_threshold = emotion_min_top_score
+                    margin_threshold = emotion_min_margin
+
+                if score < top_score_threshold:
+                    rejected_low_top_score += 1
+                    continue
+                if margin < margin_threshold:
+                    rejected_low_margin += 1
+                    continue
+
             if not is_category_suitable(text, category):
                 continue
             buckets[category].append(text)
@@ -400,6 +428,7 @@ def classify_candidates(
         "kept": sum(len(values) for values in buckets.values()),
         "rejected_low_top_score": rejected_low_top_score,
         "rejected_low_margin": rejected_low_margin,
+        "rejected_high_neutral_margin": rejected_high_neutral_margin,
         "rejected_unmapped": rejected_unmapped,
         "elapsed_seconds": round(elapsed, 3),
         "label_counts": dict(sorted(label_counts.items())),
@@ -447,20 +476,24 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
         classifier=classifier,
         candidates=everyday,
         source_name="daily_dialog",
-        min_top_score=args.min_top_score,
-        min_margin=args.min_margin,
+        emotion_min_top_score=args.emotion_min_top_score,
+        emotion_min_margin=args.emotion_min_margin,
+        ambiguous_min_top_score=args.ambiguous_min_top_score,
+        ambiguous_min_margin=args.ambiguous_min_margin,
         neutral_min_top_score=args.neutral_min_top_score,
-        neutral_min_margin=args.neutral_min_margin,
+        neutral_max_margin=args.neutral_max_margin,
         batch_size=args.batch_size,
     )
     stream_buckets, stream_report = classify_candidates(
         classifier=classifier,
         candidates=stream,
         source_name="go_emotions",
-        min_top_score=args.min_top_score,
-        min_margin=args.min_margin,
+        emotion_min_top_score=args.emotion_min_top_score,
+        emotion_min_margin=args.emotion_min_margin,
+        ambiguous_min_top_score=args.ambiguous_min_top_score,
+        ambiguous_min_margin=args.ambiguous_min_margin,
         neutral_min_top_score=args.neutral_min_top_score,
-        neutral_min_margin=args.neutral_min_margin,
+        neutral_max_margin=args.neutral_max_margin,
         batch_size=args.batch_size,
     )
 
@@ -477,23 +510,25 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
     output["meta"] = {
         "version": "hybrid-v01",
         "model": args.model,
-        "min_top_score": args.min_top_score,
-        "min_margin": args.min_margin,
+        "emotion_min_top_score": args.emotion_min_top_score,
+        "emotion_min_margin": args.emotion_min_margin,
+        "ambiguous_min_top_score": args.ambiguous_min_top_score,
+        "ambiguous_min_margin": args.ambiguous_min_margin,
         "neutral_min_top_score": args.neutral_min_top_score,
-        "neutral_min_margin": args.neutral_min_margin,
+        "neutral_max_margin": args.neutral_max_margin,
         "max_words": args.max_words,
         "sources": {
             "everyday": f"daily_dialog raw train.zip mirror ({DAILY_DIALOG_HF_MIRROR})",
             "stream": "google-research-datasets/go_emotions:simplified",
         },
-        "confidence_filter": "for Positive/Negative/Ambiguous, sum mapped 4-way category scores and keep items where top_category_score >= min_top_score and top_category_score - second_category_score >= min_margin; for Neutral, use original neutral top-label score with separate neutral thresholds because Neutral is a singleton label",
+        "confidence_filter": "Positive/Negative require high 4-way category dominance; Ambiguous uses a looser 4-way category dominance filter; Neutral requires original neutral top-label with low top-vs-second margin because Neutral represents weak or mixed affect rather than strong dominance",
         "quality_filters": [
             "max 5 words",
             "ASCII text",
             "URL/bracket/hashtag/mention/markdown removal",
             "context-bound third-person pronoun removal",
             "basic profanity removal",
-            "question removal for Positive and Negative categories",
+            "question removal for Positive, Negative, and Neutral categories",
         ],
         "reports": [everyday_report, stream_report],
         "bucket_counts": {

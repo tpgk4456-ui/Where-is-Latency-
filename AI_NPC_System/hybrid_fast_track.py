@@ -74,8 +74,10 @@ class HybridFastTrackConfig:
     seed: int | None = None
     min_runtime_score: float = 0.0
     min_runtime_margin: float = 0.0
+    ambiguous_min_runtime_score: float = 0.0
+    ambiguous_min_runtime_margin: float = 0.0
     neutral_min_runtime_score: float = 0.0
-    neutral_min_runtime_margin: float = 0.0
+    neutral_max_runtime_margin: float = 1.0
     spacy_model: str = "en_core_web_sm"
     everyday_weight: float = 0.60
     stream_weight: float = 0.40
@@ -179,14 +181,26 @@ class HybridFastTrack:
         if label == "neutral":
             category = "Neutral"
             score_threshold = self.config.neutral_min_runtime_score
-            margin_threshold = self.config.neutral_min_runtime_margin
+            if score < score_threshold or margin > self.config.neutral_max_runtime_margin:
+                category = "Neutral"
+            return {
+                "category": category,
+                "label": label,
+                "score": score,
+                "margin": margin,
+                "category_scores": category_scores,
+            }
         else:
             ranked_categories = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
             category, score = ranked_categories[0]
             second_score = ranked_categories[1][1] if len(ranked_categories) > 1 else 0.0
             margin = score - second_score
-            score_threshold = self.config.min_runtime_score
-            margin_threshold = self.config.min_runtime_margin
+            if category == "Ambiguous":
+                score_threshold = self.config.ambiguous_min_runtime_score
+                margin_threshold = self.config.ambiguous_min_runtime_margin
+            else:
+                score_threshold = self.config.min_runtime_score
+                margin_threshold = self.config.min_runtime_margin
 
         if score < score_threshold or margin < margin_threshold:
             category = "Neutral"
@@ -288,8 +302,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-runtime-score", type=float, default=0.0)
     parser.add_argument("--min-runtime-margin", type=float, default=0.0)
+    parser.add_argument("--ambiguous-min-runtime-score", type=float, default=0.0)
+    parser.add_argument("--ambiguous-min-runtime-margin", type=float, default=0.0)
     parser.add_argument("--neutral-min-runtime-score", type=float, default=0.0)
-    parser.add_argument("--neutral-min-runtime-margin", type=float, default=0.0)
+    parser.add_argument("--neutral-max-runtime-margin", type=float, default=1.0)
     parser.add_argument("--everyday-weight", type=float, default=0.60)
     parser.add_argument("--stream-weight", type=float, default=0.40)
     return parser.parse_args()
@@ -304,8 +320,10 @@ def main() -> int:
             seed=args.seed,
             min_runtime_score=args.min_runtime_score,
             min_runtime_margin=args.min_runtime_margin,
+            ambiguous_min_runtime_score=args.ambiguous_min_runtime_score,
+            ambiguous_min_runtime_margin=args.ambiguous_min_runtime_margin,
             neutral_min_runtime_score=args.neutral_min_runtime_score,
-            neutral_min_runtime_margin=args.neutral_min_runtime_margin,
+            neutral_max_runtime_margin=args.neutral_max_runtime_margin,
             everyday_weight=args.everyday_weight,
             stream_weight=args.stream_weight,
         )
