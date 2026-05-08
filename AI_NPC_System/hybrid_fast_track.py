@@ -214,6 +214,8 @@ class HybridFastTrack:
             return reaction
         if reaction.endswith("?"):
             return f"{reaction[:-1].strip()} {keyword}?"
+        if reaction.endswith((".", "!")):
+            return f"{reaction} About {keyword}?"
         return f"{reaction} {keyword}?"
 
     def generate(self, user_text: str) -> dict[str, Any]:

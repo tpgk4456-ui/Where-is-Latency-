@@ -130,6 +130,8 @@ BLOCKED_TERMS = {
     "boring",
     "asshole",
     "arrest",
+    "brace",
+    "bullying",
     "cringy",
     "death",
     "dick",
@@ -142,6 +144,7 @@ BLOCKED_TERMS = {
     "incel",
     "goddamn",
     "jail",
+    "killing",
     "scam",
     "slur",
     "suck",
@@ -186,6 +189,8 @@ BLOCKED_REFERENCE_TERMS = {
     "videos",
     "wig",
     "woke",
+    "woo",
+    "socdems",
 }
 ALLOWED_UPPERCASE_TOKENS = {"I", "OK", "TV"}
 BLOCKED_PHRASE_RE = re.compile(
@@ -488,11 +493,15 @@ def llm_accepts_reaction(args: argparse.Namespace, text: str, category: str, sou
     prompt = (
         "You are filtering short English VTuber reaction lines.\n"
         "Return exactly YES or NO.\n\n"
-        "Accept only if the sentence can be spoken as a short, standalone live-stream reaction.\n"
-        "Reject if it is context-dependent, too specific, a full personal situation, a command/request, "
-        "a product/place/person reference, sexual/political/offensive, confusing without thread context, "
-        "or unnatural for TTS.\n"
-        "Questions are acceptable only for Ambiguous reactions.\n\n"
+        "Accept only generic, short, standalone reactions that a VTuber can say immediately after a viewer message.\n"
+        "The line must still sound natural if no image, post, thread, person, place, fandom, or topic is visible.\n"
+        "When unsure, reject.\n\n"
+        "Reject commands, advice, requests, personal facts, image/post references, politics, ideology, violence, "
+        "sex, insults, profanity, niche slang, roleplay narration, or any line that is mainly about a specific topic.\n"
+        "Reject examples: 'Bottom right is the cutest', 'Are socdems welcome here?', "
+        "'Because killing people is wrong?', 'Bullying impacts brain', 'Brace yourself'.\n"
+        "Accept examples: 'That is awesome!', 'I am sorry.', 'Wait, really?', 'Fair enough.', 'I see.'\n"
+        "Questions are acceptable only for Ambiguous reactions and only if they are generic clarification reactions.\n\n"
         f"Target category: {category}\n"
         f"Source: {source_name}\n"
         f"Sentence: {text!r}\n\n"
@@ -524,11 +533,15 @@ def llm_accepts_reaction_batch(
         "You are filtering short English VTuber reaction lines.\n"
         "Return only a JSON array. Do not add markdown or explanations.\n"
         "Each output object must be {\"index\": number, \"accept\": true or false}.\n\n"
-        "Accept only if the sentence can be spoken as a short, standalone live-stream reaction.\n"
-        "Reject if it is context-dependent, too specific, a full personal situation, a command/request, "
-        "a product/place/person reference, sexual/political/offensive, confusing without thread context, "
-        "or unnatural for TTS.\n"
-        "Questions are acceptable only for Ambiguous reactions.\n\n"
+        "Accept only generic, short, standalone reactions that a VTuber can say immediately after a viewer message.\n"
+        "The line must still sound natural if no image, post, thread, person, place, fandom, or topic is visible.\n"
+        "When unsure, reject.\n\n"
+        "Reject commands, advice, requests, personal facts, image/post references, politics, ideology, violence, "
+        "sex, insults, profanity, niche slang, roleplay narration, or any line that is mainly about a specific topic.\n"
+        "Reject examples: 'Bottom right is the cutest', 'Are socdems welcome here?', "
+        "'Because killing people is wrong?', 'Bullying impacts brain', 'Brace yourself'.\n"
+        "Accept examples: 'That is awesome!', 'I am sorry.', 'Wait, really?', 'Fair enough.', 'I see.'\n"
+        "Questions are acceptable only for Ambiguous reactions and only if they are generic clarification reactions.\n\n"
         f"Target category: {category}\n"
         f"Source: {source_name}\n"
         f"Items: {json.dumps(items, ensure_ascii=False)}"
