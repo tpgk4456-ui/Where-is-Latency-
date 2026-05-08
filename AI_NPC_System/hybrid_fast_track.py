@@ -74,6 +74,8 @@ class HybridFastTrackConfig:
     seed: int | None = None
     min_runtime_score: float = 0.0
     min_runtime_margin: float = 0.0
+    neutral_min_runtime_score: float = 0.0
+    neutral_min_runtime_margin: float = 0.0
     spacy_model: str = "en_core_web_sm"
     everyday_weight: float = 0.60
     stream_weight: float = 0.40
@@ -132,6 +134,14 @@ def top_label(score_items: list[dict[str, Any]]) -> str:
     return str(max(score_items, key=lambda item: float(item.get("score", 0.0))).get("label", "neutral")).lower()
 
 
+def ranked_label_scores(score_items: list[dict[str, Any]]) -> list[tuple[str, float]]:
+    ranked = [
+        (str(item.get("label", "neutral")).lower(), float(item.get("score", 0.0)))
+        for item in score_items
+    ]
+    return sorted(ranked, key=lambda item: item[1], reverse=True)
+
+
 class HybridFastTrack:
     def __init__(self, config: HybridFastTrackConfig | None = None) -> None:
         self.config = config or HybridFastTrackConfig()
@@ -160,13 +170,25 @@ class HybridFastTrack:
     def classify_emotion(self, text: str) -> dict[str, Any]:
         raw = self.classifier(text[:512], truncation=True)
         score_items = normalize_score_list(raw)
-        label = top_label(score_items)
-        category_scores = aggregate_category_scores(score_items)
-        ranked_categories = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
-        category, score = ranked_categories[0]
-        second_score = ranked_categories[1][1] if len(ranked_categories) > 1 else 0.0
+        ranked_labels = ranked_label_scores(score_items)
+        label, score = ranked_labels[0]
+        second_score = ranked_labels[1][1] if len(ranked_labels) > 1 else 0.0
         margin = score - second_score
-        if score < self.config.min_runtime_score or margin < self.config.min_runtime_margin:
+        category_scores = aggregate_category_scores(score_items)
+
+        if label == "neutral":
+            category = "Neutral"
+            score_threshold = self.config.neutral_min_runtime_score
+            margin_threshold = self.config.neutral_min_runtime_margin
+        else:
+            ranked_categories = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
+            category, score = ranked_categories[0]
+            second_score = ranked_categories[1][1] if len(ranked_categories) > 1 else 0.0
+            margin = score - second_score
+            score_threshold = self.config.min_runtime_score
+            margin_threshold = self.config.min_runtime_margin
+
+        if score < score_threshold or margin < margin_threshold:
             category = "Neutral"
         return {
             "category": category,
@@ -266,6 +288,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-runtime-score", type=float, default=0.0)
     parser.add_argument("--min-runtime-margin", type=float, default=0.0)
+    parser.add_argument("--neutral-min-runtime-score", type=float, default=0.0)
+    parser.add_argument("--neutral-min-runtime-margin", type=float, default=0.0)
     parser.add_argument("--everyday-weight", type=float, default=0.60)
     parser.add_argument("--stream-weight", type=float, default=0.40)
     return parser.parse_args()
@@ -280,6 +304,8 @@ def main() -> int:
             seed=args.seed,
             min_runtime_score=args.min_runtime_score,
             min_runtime_margin=args.min_runtime_margin,
+            neutral_min_runtime_score=args.neutral_min_runtime_score,
+            neutral_min_runtime_margin=args.neutral_min_runtime_margin,
             everyday_weight=args.everyday_weight,
             stream_weight=args.stream_weight,
         )

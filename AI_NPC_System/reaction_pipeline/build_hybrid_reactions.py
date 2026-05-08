@@ -116,6 +116,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=MODEL_NAME)
     parser.add_argument("--min-top-score", type=float, default=0.45)
     parser.add_argument("--min-margin", type=float, default=0.50)
+    parser.add_argument("--neutral-min-top-score", type=float, default=0.20)
+    parser.add_argument("--neutral-min-margin", type=float, default=0.08)
     parser.add_argument("--max-words", type=int, default=5)
     parser.add_argument("--daily-split", default="train")
     parser.add_argument("--goemotions-split", default="train")
@@ -329,12 +331,22 @@ def top_label(score_items: list[dict[str, Any]]) -> str:
     return str(max(score_items, key=lambda item: float(item.get("score", 0.0))).get("label", "neutral")).lower()
 
 
+def ranked_label_scores(score_items: list[dict[str, Any]]) -> list[tuple[str, float]]:
+    ranked = [
+        (str(item.get("label", "neutral")).lower(), float(item.get("score", 0.0)))
+        for item in score_items
+    ]
+    return sorted(ranked, key=lambda item: item[1], reverse=True)
+
+
 def classify_candidates(
     classifier: Any,
     candidates: list[str],
     source_name: str,
     min_top_score: float,
     min_margin: float,
+    neutral_min_top_score: float,
+    neutral_min_margin: float,
     batch_size: int,
 ) -> tuple[dict[str, list[str]], dict[str, Any]]:
     buckets: dict[str, list[str]] = {category: [] for category in CATEGORIES}
@@ -350,18 +362,31 @@ def classify_candidates(
 
         for text, raw in zip(batch, results):
             score_items = normalize_score_list(raw)
-            label = top_label(score_items)
-            category_scores = aggregate_category_scores(score_items)
-            ranked_categories = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
-            category, score = ranked_categories[0]
-            second_score = ranked_categories[1][1] if len(ranked_categories) > 1 else 0.0
+            ranked_labels = ranked_label_scores(score_items)
+            label, score = ranked_labels[0]
+            second_score = ranked_labels[1][1] if len(ranked_labels) > 1 else 0.0
             margin = score - second_score
+            category_scores = aggregate_category_scores(score_items)
+            if label == "neutral":
+                category = "Neutral"
+                top_score_threshold = neutral_min_top_score
+                margin_threshold = neutral_min_margin
+            else:
+                ranked_categories = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
+                category, score = ranked_categories[0]
+                second_score = ranked_categories[1][1] if len(ranked_categories) > 1 else 0.0
+                margin = score - second_score
+                top_score_threshold = min_top_score
+                margin_threshold = min_margin
             label_counts[label] += 1
 
-            if score < min_top_score:
+            if category is None:
+                rejected_unmapped += 1
+                continue
+            if score < top_score_threshold:
                 rejected_low_top_score += 1
                 continue
-            if margin < min_margin:
+            if margin < margin_threshold:
                 rejected_low_margin += 1
                 continue
             if not is_category_suitable(text, category):
@@ -424,6 +449,8 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
         source_name="daily_dialog",
         min_top_score=args.min_top_score,
         min_margin=args.min_margin,
+        neutral_min_top_score=args.neutral_min_top_score,
+        neutral_min_margin=args.neutral_min_margin,
         batch_size=args.batch_size,
     )
     stream_buckets, stream_report = classify_candidates(
@@ -432,6 +459,8 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
         source_name="go_emotions",
         min_top_score=args.min_top_score,
         min_margin=args.min_margin,
+        neutral_min_top_score=args.neutral_min_top_score,
+        neutral_min_margin=args.neutral_min_margin,
         batch_size=args.batch_size,
     )
 
@@ -450,12 +479,14 @@ def build_reaction_json(args: argparse.Namespace) -> dict[str, Any]:
         "model": args.model,
         "min_top_score": args.min_top_score,
         "min_margin": args.min_margin,
+        "neutral_min_top_score": args.neutral_min_top_score,
+        "neutral_min_margin": args.neutral_min_margin,
         "max_words": args.max_words,
         "sources": {
             "everyday": f"daily_dialog raw train.zip mirror ({DAILY_DIALOG_HF_MIRROR})",
             "stream": "google-research-datasets/go_emotions:simplified",
         },
-        "confidence_filter": "after mapping 28 GoEmotions labels into 4 categories, keep items where top_category_score >= min_top_score and top_category_score - second_category_score >= min_margin",
+        "confidence_filter": "for Positive/Negative/Ambiguous, sum mapped 4-way category scores and keep items where top_category_score >= min_top_score and top_category_score - second_category_score >= min_margin; for Neutral, use original neutral top-label score with separate neutral thresholds because Neutral is a singleton label",
         "quality_filters": [
             "max 5 words",
             "ASCII text",
