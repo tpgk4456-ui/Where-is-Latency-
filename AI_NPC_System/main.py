@@ -71,7 +71,7 @@ async def run_cycle():
         # 2. Fast Lane 실행
         fast_result = fast_lane.analyze_and_react(user_input)
         
-        reaction = fast_result['reaction']
+        reaction = fast_result.get('tts_text') or fast_result['reaction']
         keyword = fast_result['keyword']
         
         # 3. [시각화] Fast Lane 결과 출력

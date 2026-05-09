@@ -1,59 +1,49 @@
-# config.py
+"""Runtime configuration for the AI NPC Fast/Slow Track prototype."""
+
+from __future__ import annotations
+
 import os
-
-# ==========================================
-# 🔑 API 키 파일 경로 (자동 인식)
-# ==========================================
-# 사용자 홈 디렉토리(예: C:\Users\my coms)를 자동으로 찾아서 Desktop 경로와 합칩니다.
-# 이제 경로 때문에 에러 날 일이 없습니다!
-# KEY_FILE_PATH = os.path.join(os.path.expanduser("~"), "Desktop", "gemini_key.txt")
-#
-# def load_api_key(filepath):
-#     """파일이 있으면 읽고, 없으면 None 반환"""
-#     print(f"📂 [Config] 키 파일 찾는 중... ({filepath})")
-#
-#     if not os.path.exists(filepath):
-#         print("⚠️ 키 파일이 없습니다. (Ollama만 사용 가능)")
-#         return None
-#
-#     try:
-#         with open(filepath, "r", encoding="utf-8") as f:
-#             key = f.read().strip()
-#             print("Gemini API 키 로드 완료!")
-#             return key
-#     except Exception as e:
-#         print(f"키 파일 읽기 실패: {e}")
-#         return None
-
-# Ollama 메인 운영: Gemini key 입력/로드 비활성화
-GEMINI_API_KEY = None
+from pathlib import Path
 
 
-# ==========================================
-# 🤖 모델 설정 (Failover)
-# ==========================================
+ROOT_DIR = Path(__file__).resolve().parent
 
-# 1순위: 로컬 Ollama
-OLLAMA_URL = "http://localhost:11434/v1"
-OLLAMA_MODEL = "gemma3:1b"  # 설치된 모델명 (llama3, mistral 등)
+# Cloud fallback is intentionally disabled by default.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or None
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# 2순위: 클라우드 Gemini (백업용)
-GEMINI_MODEL = "gemini-2.5-flash"
+# Fast Track: DistilBERT + spaCy + prebuilt hybrid reaction list.
+EMOTION_MODEL_NAME = os.getenv(
+    "EMOTION_MODEL_NAME",
+    "joeddav/distilbert-base-uncased-go-emotions-student",
+)
+SPACY_MODEL_NAME = os.getenv("SPACY_MODEL_NAME", "en_core_web_sm")
+REACTION_DB_FILE = os.getenv("REACTION_DB_FILE", "hybrid_reactions.json")
+REACTION_DB_PATH = ROOT_DIR / REACTION_DB_FILE
+FAST_TRACK_DEVICE = os.getenv("FAST_TRACK_DEVICE", "auto")
+FAST_TRACK_MIN_RUNTIME_SCORE = float(os.getenv("FAST_TRACK_MIN_RUNTIME_SCORE", "0.0"))
+FAST_TRACK_EVERYDAY_WEIGHT = float(os.getenv("FAST_TRACK_EVERYDAY_WEIGHT", "0.60"))
+FAST_TRACK_STREAM_WEIGHT = float(os.getenv("FAST_TRACK_STREAM_WEIGHT", "0.40"))
 
-# 감정 분석 모델 (Fast Lane용)
-EMOTION_MODEL_NAME = "joeddav/distilbert-base-uncased-go-emotions-student"
+# Slow Track: quality local LLM first, smaller local model second.
+LOCAL_LLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8002/v1")
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "llama3.3:70b-awq")
+LOCAL_LLM_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "EMPTY")
+LOCAL_LLM_TIMEOUT = float(os.getenv("LOCAL_LLM_TIMEOUT", "45.0"))
+LOCAL_LLM_TEMPERATURE = float(os.getenv("LOCAL_LLM_TEMPERATURE", "0.7"))
+LOCAL_LLM_MAX_TOKENS = int(os.getenv("LOCAL_LLM_MAX_TOKENS", "180"))
 
-# Fast Lane reaction DB 파일명 (AI_NPC_System 폴더 기준)
-REACTION_DB_FILE = "reactions_v03.json"
+FALLBACK_LOCAL_LLM_BASE_URL = os.getenv(
+    "FALLBACK_LOCAL_LLM_BASE_URL",
+    "http://127.0.0.1:8001/v1",
+)
+FALLBACK_LOCAL_LLM_MODEL = os.getenv("FALLBACK_LOCAL_LLM_MODEL", "qwen2.5:7b")
+FALLBACK_LOCAL_LLM_API_KEY = os.getenv("FALLBACK_LOCAL_LLM_API_KEY", "EMPTY")
+FALLBACK_LOCAL_LLM_TIMEOUT = float(os.getenv("FALLBACK_LOCAL_LLM_TIMEOUT", "20.0"))
 
-# Slow lane 예상 지연(밀리초) - bridge 전략 힌트용
-EXPECTED_SLOW_LANE_MS = 2800
+# Backward-compatible aliases for older scripts.
+OLLAMA_URL = FALLBACK_LOCAL_LLM_BASE_URL
+OLLAMA_MODEL = FALLBACK_LOCAL_LLM_MODEL
 
-# Fast Lane 전략 선택: 확률 샘플링 설정
-ACTION_SAMPLING_ENABLED = True
-ACTION_SAMPLING_TEMPERATURE = 0.9
-
-# v01.2 Calibration (Temperature Scaling)
-CALIBRATION_ENABLED = True
-CALIBRATION_TEMPERATURE = 1.15
-CALIBRATION_PARAM_FILE = "calibration_params_v012.json"
+# Slow lane ETA hint for clients/logging.
+EXPECTED_SLOW_LANE_MS = int(os.getenv("EXPECTED_SLOW_LANE_MS", "3500"))

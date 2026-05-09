@@ -1,186 +1,118 @@
-# fast_lane.py
-import json
-import random
-import time
-import os
-from pathlib import Path
+"""Compatibility wrapper for the current hybrid Fast Track runtime.
 
-import spacy
-from transformers import pipeline
+`server.py` and `main.py` still import `fast_lane.analyze_and_react()`.
+The actual implementation now lives in `hybrid_fast_track.py` and uses
+`hybrid_reactions.json`.
+"""
+
+from __future__ import annotations
 
 import config
-import merge_policy
-
-print("⚡ [Fast Lane] 모델 로딩 중...")
-
-MODEL_READY = True
-MODEL_ERROR = None
-
-try:
-    emotion_pipeline = pipeline("text-classification", model=config.EMOTION_MODEL_NAME, top_k=None)
-    nlp = spacy.load("en_core_web_sm")
-except Exception as e:
-    MODEL_READY = False
-    MODEL_ERROR = str(e)
-    emotion_pipeline = None
-    nlp = None
-    print("❌ [Fast Lane] 모델 로딩 실패")
-    print(f"   ├─ EMOTION_MODEL_NAME: {getattr(config, 'EMOTION_MODEL_NAME', 'unknown')}")
-    print(f"   ├─ spaCy model: en_core_web_sm")
-    print(f"   └─ error: {MODEL_ERROR}")
-    print("⚠️ [Fast Lane] 중립 fallback 모드로 계속 실행합니다.")
-
-DEFAULT_REACTIONS = ["I see.", "I hear you.", "Please go on."]
-
-EMOTION_CATEGORIES = {
-    "positive": [
-        "admiration", "amusement", "approval", "caring", "desire", "excitement",
-        "gratitude", "joy", "love", "optimism", "pride", "relief"
-    ],
-    "negative": [
-        "anger", "annoyance", "disappointment", "disapproval", "disgust",
-        "embarrassment", "fear", "grief", "nervousness", "remorse", "sadness"
-    ],
-    "ambiguous": ["confusion", "curiosity", "realization", "surprise"],
-    "neutral": ["neutral"],
-}
+from hybrid_fast_track import HybridFastTrack, HybridFastTrackConfig
 
 
-def _candidate_db_paths():
-    root = Path(__file__).resolve().parent
-    default_name = getattr(config, "REACTION_DB_FILE", "reactions.json")
-    yield root / default_name
-    yield root / "reactions.json"
+print("[Fast Track] Loading hybrid reaction engine...")
+
+_ENGINE: HybridFastTrack | None = None
+_ENGINE_ERROR: str | None = None
 
 
-def load_reactions():
-    for p in _candidate_db_paths():
-        if p.exists():
-            try:
-                with p.open("r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                continue
-    return {}
-
-
-REACTION_DB = load_reactions()
-
-
-def load_calibration_temperature():
-    t = float(getattr(config, "CALIBRATION_TEMPERATURE", 1.0))
-    if not getattr(config, "CALIBRATION_ENABLED", False):
-        return t
-
-    file_name = getattr(config, "CALIBRATION_PARAM_FILE", "calibration_params_v012.json")
-    p = Path(__file__).resolve().parent / file_name
-    if not p.exists():
-        return t
+def _get_engine() -> HybridFastTrack | None:
+    global _ENGINE, _ENGINE_ERROR
+    if _ENGINE is not None:
+        return _ENGINE
+    if _ENGINE_ERROR is not None:
+        return None
 
     try:
-        obj = json.loads(p.read_text(encoding="utf-8"))
-        fitted = float(obj.get("best_temperature", t))
-        return max(0.05, min(5.0, fitted))
-    except Exception as e:
-        print(f"calibration param load 에러: {e}")
-        return t
+        _ENGINE = HybridFastTrack(
+            HybridFastTrackConfig(
+                reaction_path=config.REACTION_DB_PATH,
+                model_name=config.EMOTION_MODEL_NAME,
+                device=config.FAST_TRACK_DEVICE,
+                min_runtime_score=config.FAST_TRACK_MIN_RUNTIME_SCORE,
+                spacy_model=config.SPACY_MODEL_NAME,
+                everyday_weight=config.FAST_TRACK_EVERYDAY_WEIGHT,
+                stream_weight=config.FAST_TRACK_STREAM_WEIGHT,
+            )
+        )
+        return _ENGINE
+    except Exception as exc:
+        _ENGINE_ERROR = str(exc)
+        print("[Fast Track] Hybrid engine load failed; neutral fallback enabled.")
+        print(f"  error: {_ENGINE_ERROR}")
+        return None
 
 
-CALIBRATION_TEMP = load_calibration_temperature()
+def _fallback_response(text: str) -> dict:
+    del text
+    return {
+        "emotion_label": "neutral",
+        "emotion_detail": "neutral",
+        "reaction": "I see.",
+        "keyword": None,
+        "echo_text": "",
+        "strategy": "fallback",
+        "reaction_source": "fallback",
+        "top1": 0.0,
+        "margin": 0.0,
+        "entropy": 0.0,
+        "confidence_band": "fallback",
+        "action_probs": {},
+        "strategy_scores": {},
+        "calibration_temp": None,
+        "effective_temperature": None,
+        "category_scores": {
+            "positive": 0.0,
+            "negative": 0.0,
+            "ambiguous": 0.0,
+            "neutral": 1.0,
+        },
+        "bert_time": "0.0000s",
+        "spacy_time": "0.0000s",
+        "latency_ms": 0.0,
+    }
 
 
-def _aggregate_category_scores(all_scores):
-    category_scores = {"positive": 0.0, "negative": 0.0, "ambiguous": 0.0, "neutral": 0.0}
-    for item in all_scores:
-        label = item["label"]
-        score = float(item["score"])
-        for category, labels in EMOTION_CATEGORIES.items():
-            if label in labels:
-                category_scores[category] += score
-                break
-    return category_scores
+def analyze_and_react(text: str) -> dict:
+    engine = _get_engine()
+    if engine is None:
+        return _fallback_response(text)
 
-
-def _pick_reaction(emotion_label, strategy):
-    # v03: only 5 groups are used (positive/neutral/negative/ambiguous/echoing)
-    if strategy == "echo_first" and isinstance(REACTION_DB.get("echoing"), list):
-        arr = REACTION_DB.get("echoing") or DEFAULT_REACTIONS
-        return random.choice(arr)
-
-    arr = REACTION_DB.get(emotion_label, DEFAULT_REACTIONS)
-    return random.choice(arr)
-
-
-def analyze_and_react(text):
-    t0 = time.time()
-    final_emotion = "neutral"
-    category_scores = {"positive": 0.0, "negative": 0.0, "ambiguous": 0.0, "neutral": 1.0}
-
-    if not MODEL_READY:
-        print("⚠️ [Fast Lane] fallback 중: 모델 미준비 상태로 neutral 처리")
-        if MODEL_ERROR:
-            print(f"   └─ last_error: {MODEL_ERROR}")
-    else:
-        try:
-            short_text = text[:512]
-            all_scores = emotion_pipeline(short_text)[0]
-            category_scores = _aggregate_category_scores(all_scores)
-            final_emotion = max(category_scores, key=category_scores.get)
-        except Exception as e:
-            print(f"감정 분석 에러: {e}")
-
-    bert_time = time.time() - t0
-
-    t1 = time.time()
-    keyword = None
-    echo_text = ""
-    try:
-        if nlp is not None:
-            doc = nlp(text)
-            keywords = [t.text for t in doc if t.pos_ in ["NOUN", "PROPN"]]
-            if keywords:
-                keyword = keywords[-1]
-                echo_text = f"{keyword}?"
-    except Exception as e:
-        print(f"spaCy 키워드 추출 에러: {e}")
-    spacy_time = time.time() - t1
-
-    policy = merge_policy.select_strategy(
-        category_scores=category_scores,
-        has_keyword=bool(keyword),
-        user_text=text,
-        llm_eta_ms=getattr(config, "EXPECTED_SLOW_LANE_MS", 0),
-        temperature=getattr(config, "ACTION_SAMPLING_TEMPERATURE", 0.9),
-        sample=getattr(config, "ACTION_SAMPLING_ENABLED", True),
-        calibration_temp=CALIBRATION_TEMP,
-    )
-
-    strategy = policy["strategy"]
-
-    # v03: echoing은 echo_first 전략에서만 허용
-    if strategy != "echo_first":
-        echo_text = ""
-
-    reaction = _pick_reaction(final_emotion, strategy)
+    result = engine.generate(text)
+    category = str(result["emotion"])
+    category_key = category.lower()
+    score = float(result["emotion_score"])
+    margin = float(result["emotion_margin"])
+    category_scores = {
+        str(key).lower(): value for key, value in result.get("category_scores", {}).items()
+    }
 
     return {
-        "emotion_label": final_emotion,
-        "emotion_detail": final_emotion,
-        "reaction": reaction,
-        "keyword": keyword,
-        "echo_text": echo_text,
-        "strategy": strategy,
-        "top1": round(policy["top1"], 4),
-        "margin": round(policy["margin"], 4),
-        "entropy": round(policy["entropy"], 4),
-        "confidence_band": policy["confidence_band"],
-        "action_probs": policy.get("action_probs", {}),
-        "strategy_scores": policy.get("strategy_scores", {}),
-        "calibration_temp": policy.get("calibration_temp"),
-        "effective_temperature": policy.get("effective_temperature"),
-        "category_scores": {k: round(v, 4) for k, v in category_scores.items()},
-        "bert_time": f"{bert_time:.4f}s",
-        "spacy_time": f"{spacy_time:.4f}s",
+        "emotion_label": category_key,
+        "emotion_detail": result["emotion_label"],
+        "reaction": result["reaction"],
+        "tts_text": result["tts_text"],
+        "keyword": result["keyword"],
+        "keywords": result["keywords"],
+        "echo_text": result["tts_text"] if result["keyword"] else "",
+        "strategy": f"hybrid_{result['reaction_source']}",
+        "reaction_source": result["reaction_source"],
+        "top1": round(score, 4),
+        "margin": round(margin, 4),
+        "entropy": 0.0,
+        "confidence_band": "top1",
+        "action_probs": {
+            "everyday": config.FAST_TRACK_EVERYDAY_WEIGHT,
+            "stream": config.FAST_TRACK_STREAM_WEIGHT,
+        },
+        "strategy_scores": {},
+        "calibration_temp": None,
+        "effective_temperature": None,
+        "category_scores": category_scores,
+        "bert_time": f"{result['emotion_ms'] / 1000.0:.4f}s",
+        "spacy_time": f"{result['keyword_ms'] / 1000.0:.4f}s",
+        "latency_ms": result["latency_ms"],
     }
 
 

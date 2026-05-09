@@ -1,6 +1,0 @@
-{
-  "version": "v01.2",
-  "best_temperature": 1.05,
-  "objective": "min_nll",
-  "dataset_size": 8
-}

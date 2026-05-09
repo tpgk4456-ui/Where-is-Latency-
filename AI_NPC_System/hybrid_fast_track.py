@@ -213,7 +213,7 @@ class HybridFastTrack:
         if not keyword:
             return reaction
         if reaction.endswith("?"):
-            return f"{reaction[:-1].strip()} {keyword}?"
+            return f"{reaction} About {keyword}?"
         if reaction.endswith((".", "!")):
             return f"{reaction} About {keyword}?"
         return f"{reaction} {keyword}?"

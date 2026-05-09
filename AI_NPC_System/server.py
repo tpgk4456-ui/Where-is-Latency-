@@ -36,12 +36,17 @@ async def handle_client(reader, writer):
             fast_result = fast_lane.analyze_and_react(user_text)
             total_latency = time.time() - start_time
             
+            tts_text = fast_result.get("tts_text") or fast_result["reaction"]
+
             fast_packet = {
                 "schema_version": 2,
                 "type": "fast",
                 "emotion": fast_result['emotion_label'],
-                "reaction": fast_result['reaction'],
+                "reaction": tts_text,
+                "raw_reaction": fast_result['reaction'],
+                "tts_text": tts_text,
                 "echo_text": fast_result['echo_text'],
+                "reaction_source": fast_result.get("reaction_source"),
                 "bert_time": fast_result['bert_time'],
                 "spacy_time": fast_result['spacy_time'],
                 "strategy": fast_result.get('strategy'),
@@ -59,7 +64,7 @@ async def handle_client(reader, writer):
             print(f"   ├─ Time: {total_latency:.4f}s (BERT: {fast_result['bert_time']}, SpaCy: {fast_result['spacy_time']})")
             print(f"   ├─ Emotion: {fast_result['emotion_label']} ({fast_result.get('confidence_band')})")
             print(f"   ├─ Strategy: {fast_result.get('strategy')} / top1={fast_result.get('top1')} margin={fast_result.get('margin')} entropy={fast_result.get('entropy')}")
-            print(f"   ├─ Reaction: \"{fast_result['reaction']}\"")
+            print(f"   ├─ Reaction: \"{tts_text}\"")
             if fast_result['echo_text']:
                 print(f"   └─ Echoing:  \"{fast_result['echo_text']}\"") # 서버 로그에도 표시
             
@@ -72,7 +77,7 @@ async def handle_client(reader, writer):
             # Fast Lane의 결과(reaction)를 문맥으로 넘겨줍니다.
             llm_reply = await slow_lane.generate_response(
                 user_text,
-                fast_result['reaction'],
+                tts_text,
                 fast_result.get('strategy')
             )
             

@@ -1,9 +1,0 @@
-text,emotion_label,strategy,reaction,echo_text,confidence_band,top1,margin,entropy,calibration_temp,effective_temperature,p_emotion_first,p_echo_first,p_bridge,p_neutral_minimal
-I just got promoted at work and I feel amazing.,positive,echo_first,Got it—,work?,high,0.8252,0.6917,0.4206,1.05,0.945,0.499686,0.219773,0.214311,0.06623
-I am really upset because my best friend ignored me.,negative,emotion_first,That’s great.,friend?,high,0.8711,0.7963,0.3498,1.05,0.945,0.569802,0.221088,0.159069,0.050042
-I am drinking water and reading emails right now.,positive,bridge,"Mm, go on—",emails?,low,0.4273,0.1352,0.8397,1.05,0.945,0.097548,0.10438,0.607519,0.190553
-I feel terrified about tomorrow.,negative,emotion_first,Nice.,tomorrow?,high,0.9073,0.8556,0.2769,1.05,0.945,0.620666,0.216847,0.123426,0.039061
-That was a wonderful surprise for me.,positive,bridge,Right—,surprise?,medium,0.6237,0.2762,0.5634,1.05,0.945,0.251346,0.1707,0.445808,0.132145
-Can you explain this again?,ambiguous,bridge,Right—,,medium,0.5678,0.2409,0.6839,1.05,0.945,0.08236,0.099721,0.657926,0.159994
-I feel confused and not sure what to do.,ambiguous,bridge,I hear you—,,high,0.851,0.7511,0.3821,1.05,0.945,0.38652,0.142614,0.375904,0.094963
-Everything is normal and calm today.,positive,neutral_minimal,I see.,,medium,0.6914,0.5569,0.6687,1.05,0.945,0.307181,0.19286,0.380501,0.119458
